@@ -1,0 +1,12 @@
+# Lightweight runtime dependencies for prop_trader's live trading / dashboard
+# server (data fetch, technical indicators, execution, dashboard HTTP server).
+#
+# The TimesFM forecasting pipeline (fine-tuning, few-shot adaptation, resident
+# inference worker) needs a much heavier, separate environment -- see
+# prop_trader/requirements-timesfm.lock.txt and prop_trader/FORECASTING.md.
+
+requests>=2.31
+numpy>=1.26
+pandas>=2.0
+ta>=0.11.0
+websocket-client==1.8.0
