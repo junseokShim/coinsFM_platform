@@ -40,7 +40,13 @@ def mode_paths(mode):
 ENTRY_THRESHOLD = 0.002   # matches the documented "0.2% after cost" entry gate
 DAILY_MDD_LIMIT = 0.03    # UTC-day drawdown from day-start equity that halts new entries
 STOP_FRACTION = 0.025     # matches engine.Config's backtested stop-loss
-REWARD_MULTIPLE = 2       # matches engine.Config's backtested reward multiple -> 5% take-profit
+# REWARD_MULTIPLE=2 (5% take-profit) was inherited from engine.py's old breakout-strategy
+# backtest, never re-validated against the live multiframe system's actual holding period.
+# Checked live 2026-09-11: of 29 closed positions that reached horizon timeout (68% of all
+# trades), the realized entry->exit move ranged -1.5%..+3.38%, mean ~0% -- not one came close
+# to 5%. The old target was effectively decorative; 1 (2.5% take-profit, symmetric with the
+# stop) is reachable given this system's real volatility instead of only ever exiting on time.
+REWARD_MULTIPLE = 1
 FEE = 0.001
 SLIPPAGE = 0.001
 MIN_ORDER_KRW = 5000.     # Upbit's exchange-wide minimum notional for KRW markets
