@@ -30,8 +30,17 @@ def write_csv(path, rows):
         writer=csv.DictWriter(f, fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
 
 
-def evaluate(interval, source=Path('data/current'), root=Path('runs/forecast5')):
-    run=root/interval;out=Path('runs/hybrid')/interval;out.mkdir(parents=True,exist_ok=True)
+def evaluate(interval, source=Path('data/current'), root=Path('runs/forecast5'), out_root=Path('runs/hybrid')):
+    # out_root defaults to the exact path predict_symbol() reads live calibrators from
+    # (runs/hybrid/{interval}/calibrator.json) -- pass a different out_root for any ad-hoc/
+    # research run (e.g. a different source or root) so it never overwrites the calibrator the
+    # live trader is actively using. (Incident 2026-09-11: an ad-hoc Upbit-data comparison run
+    # with default out_root silently clobbered the production 1h calibrator, blocking every live
+    # 1h forecast with "Technical calibrator belongs to another model training snapshot" until
+    # the correct calibrator was regenerated.)
+    if root!=Path('runs/forecast5') and out_root==Path('runs/hybrid'):
+        raise ValueError('root is non-default but out_root was left at the live path -- pass an explicit out_root')
+    run=root/interval;out=out_root/interval;out.mkdir(parents=True,exist_ok=True)
     path=source/f'{interval}.csv'
     protocol=json.loads((run/'protocol.json').read_text())
     if digest(path)!=protocol['data_sha256']:
