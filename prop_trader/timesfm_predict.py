@@ -73,7 +73,14 @@ def predict_symbol(base,run_dir,protocol,bars,as_of,shots,device,use_technical=T
         losses.append(loss.item())
     model.eval()
     with torch.no_grad():
-        after=model(past_values=recent,forecast_context_len=context,truncate_negative=False).mean_predictions[0,:horizon].cpu().tolist()
+        after_out=model(past_values=recent,forecast_context_len=context,truncate_negative=False)
+        after=after_out.mean_predictions[0,:horizon].cpu().tolist()
+        # TimesFM 2.5 natively predicts 9 quantiles (indices 1..9 of the last dim, config.quantiles
+        # = 0.1..0.9; index 0 is a separate point-forecast channel, unused here) alongside the
+        # point forecast -- no separate variance model needed for forecast uncertainty.
+        quantile_log_returns=None
+        if after_out.full_predictions is not None and after_out.full_predictions.shape[-1]>=10:
+            quantile_log_returns=after_out.full_predictions[0,:horizon,1:10].cpu().tolist()
     if not all(math.isfinite(v) for v in before+after):raise ValueError('Non-finite forecast')
     as_of_close=datetime.fromisoformat(as_of)+delta
     prices=[anchor*math.exp(v) for v in after]
@@ -83,6 +90,19 @@ def predict_symbol(base,run_dir,protocol,bars,as_of,shots,device,use_technical=T
             np.array([[technical_features[k] for k in FEATURES]]))[0]
         prices=(anchor*np.exp(values)).tolist()
         if not all(math.isfinite(v) and v>0 for v in prices):raise ValueError('Invalid hybrid forecast')
+    quantile_prices=None
+    forecast_uncertainty=None
+    if quantile_log_returns is not None and all(math.isfinite(v) for step in quantile_log_returns for v in step):
+        # Shift each quantile step by the same calibration delta applied to the point forecast
+        # (delta = calibrated - raw, in price space), so the reported band stays centered on
+        # `prices` without pretending the calibrator itself was fit on quantile targets.
+        delta=[c-r for c,r in zip(prices,raw_prices)]
+        quantile_prices=[[anchor*math.exp(q)+d for q in step] for step,d in zip(quantile_log_returns,delta)]
+        if all(math.isfinite(p) and p>0 for step in quantile_prices for p in step):
+            q10,q90=quantile_prices[-1][0],quantile_prices[-1][-1]
+            forecast_uncertainty=(q90-q10)/anchor
+        else:
+            quantile_prices=None
     points=forecast_points(as_of,interval,prices)
     stats=path_stats(anchor,prices)
     generated_at=datetime.now(timezone.utc).isoformat()
@@ -97,6 +117,7 @@ def predict_symbol(base,run_dir,protocol,bars,as_of,shots,device,use_technical=T
                 forecast=[dict(horizon=p['step'],timestamp=p['candle_close'],predicted_close=p['predicted_close']) for p in points],
                 max_predicted_return=stats['max_predicted_return'],min_predicted_return=stats['min_predicted_return'],
                 forecast_slope=stats['forecast_slope'],forecast_consistency=stats['forecast_consistency'],
+                quantile_prices=quantile_prices,forecast_uncertainty=forecast_uncertainty,
                 note='Forecast after last historical bar; future targets not evaluated')
     for i,r in enumerate(stats['return_by_step'],1):record[f'return_t{i}']=r
     if save_adapter:

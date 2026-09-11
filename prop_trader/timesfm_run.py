@@ -83,13 +83,15 @@ def main():
     p.add_argument('--model',default=MODEL)
     p.add_argument('--interval',choices=list(SECONDS),default='1h')
     p.add_argument('--rolling-split',action='store_true')
+    p.add_argument('--device',choices=['cpu','cuda','mps'],default=None,
+                    help='Override auto-selected device; used to keep a background retrain off the GPU while live inference uses it')
     args=p.parse_args()
     if args.context<32 or args.context%32 or not 1<=args.horizon<=128 or min(args.samples,args.epochs,args.batch)<1:
         raise ValueError('Invalid training dimensions')
     args.out.mkdir(parents=True,exist_ok=True)
     torch.manual_seed(42);random.seed(42);np.random.seed(42)
     torch.set_num_threads(4)
-    device='cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+    device=args.device or ('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     seconds=SECONDS[args.interval]
     splits=windows(args.csv,args.context,args.horizon,seconds,args.rolling_split)
     train=random.sample(splits['train'],min(args.samples,len(splits['train'])))

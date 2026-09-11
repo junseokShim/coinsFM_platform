@@ -84,6 +84,9 @@ def run(request_path, output_path, stop_path, max_jobs=None, parent_pid=None):
     # cautious but because inference throughput couldn't keep up with the universe size.
     torch.set_num_threads(max(1, os.cpu_count() or 4))
     torch.manual_seed(42)
+    # Apple GPU when available: frees the CPU for the concurrent daily LoRA retrain subprocess
+    # (pinned to 'cpu' in live_trader._retrain_once) and is faster per-call than CPU once warm.
+    device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
     protocols = {iv: read_json(Path('runs/forecast5')/iv/'protocol.json', {}) for iv in FRAMES}
     if len({p['model'] for p in protocols.values()}) != 1:
         raise ValueError('상주 모델의 기본 체크포인트가 주기별로 다릅니다')
@@ -95,7 +98,7 @@ def run(request_path, output_path, stop_path, max_jobs=None, parent_pid=None):
             shots[iv] = 8
     started = time.monotonic()
     base = TimesFm2_5ModelForPrediction.from_pretrained(protocols['1h']['model'],
-                dtype=torch.float32, local_files_only=True).to('cpu')
+                dtype=torch.float32, local_files_only=True).to(device)
     load_seconds = time.monotonic()-started
     records, errors, attempted, retry = {}, {}, set(), {}
     completed = 0
@@ -123,7 +126,7 @@ def run(request_path, output_path, stop_path, max_jobs=None, parent_pid=None):
             bars = completed_bars(client, market, interval, cutoff)
             attempted.add(job)  # Few-shot is invoked only once for this completed bar.
             row, base = predict_symbol(base, Path('runs/forecast5')/interval, protocols[interval],
-                                       bars, bars[-1].timestamp, shots[interval], 'cpu', save_adapter=False)
+                                       bars, bars[-1].timestamp, shots[interval], device, save_adapter=False)
             row['history'] = [dict(t=b.timestamp,o=b.open,h=b.high,l=b.low,c=b.close) for b in bars[-60:]]
             records.setdefault(market, {})[interval] = row
             errors.pop(market+':'+interval, None)

@@ -24,7 +24,7 @@ from .forecast_time import SECONDS
 from .execution_rules import timestamp, fresh_forecast, reprice, sell_quantity, minimum_entry, fills
 from .multiframe import (decide as decide_multiframe, buy_budget, exit_fraction, candidate_score,
                           partial_qualifies, partial_budget, hourly_only)
-from .analog_signal import feature_vector, load_history, build_analog_db, analog_signal, confirms_buy
+from .analog_signal import feature_vector, load_history, build_analog_db, analog_signal, confirms_buy, too_uncertain
 
 LIVE_ROOT = Path('runs/live')
 RANKINGS_DIR = Path('runs/rankings')
@@ -38,6 +38,7 @@ def mode_paths(mode):
     return dict(state=root / 'state.json', equity=root / 'equity.csv', decisions=root / 'decisions.jsonl')
 
 ENTRY_THRESHOLD = 0.002   # matches the documented "0.2% after cost" entry gate
+DAILY_MDD_LIMIT = 0.03    # UTC-day drawdown from day-start equity that halts new entries
 STOP_FRACTION = 0.025     # matches engine.Config's backtested stop-loss
 REWARD_MULTIPLE = 2       # matches engine.Config's backtested reward multiple -> 5% take-profit
 FEE = 0.001
@@ -64,6 +65,12 @@ class LiveConfig:
     max_krw_per_trade: float = 10_000.
     paper_capital: float = 1_000_000.
     entry_threshold: float = ENTRY_THRESHOLD
+    # Partial-conviction (hourly_only fallback) entries need a much higher bar than the full
+    # 3-frame gate: live data (2026-09-10, n=23) showed full-conviction buys at 66.7% win rate
+    # (+665 krw) vs. partial-conviction at 29.4% (-729 krw) -- the missing 1m/1d confirmation is
+    # a real accuracy gap, not just noise, so it needs its own stricter threshold rather than
+    # sharing entry_threshold.
+    partial_entry_threshold: float = 0.01
     universe_top: int = 12               # how many top-24h-volume KRW markets to rank each refresh
     retrain_seconds: int = 86400         # how often the backbone LoRA adapter retrains; see _retrain_once
     analog_gate_enabled: bool = False    # off by default. Once on, it self-activates: a no-op
@@ -74,6 +81,12 @@ class LiveConfig:
     analog_min_n: int = 15
     analog_min_win_rate: float = 0.55
     analog_k: int = 30
+    # TimesFM 2.5's own native quantile spread ((q90-q10)/anchor at the forecast horizon) --
+    # unlike the analog gate, this needs no accumulated history, so it's independent of
+    # analog_gate_enabled. None (default) leaves it purely observational until enough real
+    # forecast_uncertainty values have been seen live to pick an informed cutoff -- same
+    # observe-before-enforce philosophy as the analog gate's own self-activation.
+    analog_max_uncertainty: float = None
 
     def __post_init__(self):
         if self.mode not in ('paper', 'test', 'live'):
@@ -89,6 +102,8 @@ class LiveConfig:
             raise ValueError('Invalid sizing configuration')
         if self.entry_threshold < 0:
             raise ValueError('entry_threshold must be >=0')
+        if not math.isfinite(self.partial_entry_threshold) or self.partial_entry_threshold < 0:
+            raise ValueError('partial_entry_threshold must be >=0')
         if not 1 <= self.universe_top <= 100:
             # The resident-worker/WebSocket path (_realtime_tick) has no dependency on
             # upbit_data.py's own 30-market cap -- that only bound the legacy subprocess-based
@@ -101,6 +116,9 @@ class LiveConfig:
             raise ValueError('analog_min_n and analog_k must be >=1')
         if not 0 <= self.analog_min_win_rate <= 1:
             raise ValueError('analog_min_win_rate must be 0..1')
+        if self.analog_max_uncertainty is not None and (
+                not math.isfinite(self.analog_max_uncertainty) or self.analog_max_uncertainty <= 0):
+            raise ValueError('analog_max_uncertainty must be >0 when set')
 
 
 def evaluate_position(position, price, now_ts):
@@ -213,6 +231,9 @@ class LiveTrader:
         self.cash = cfg.paper_capital
         self.baseline_equity = None
         self.baseline_set_at = None
+        self.day_anchor_equity = None
+        self.day_anchor_date = None
+        self.daily_return = None
         self._external_flow_cache = {'value': 0., 'at': 0.}
         self.started_at = datetime.now(timezone.utc).isoformat()
         self.last_tick_at = None
@@ -258,6 +279,8 @@ class LiveTrader:
                     self.cash = saved.get('cash', self.cfg.paper_capital)
                     self.baseline_equity = saved.get('baseline_equity')
                     self.baseline_set_at = saved.get('baseline_set_at')
+                    self.day_anchor_equity = saved.get('day_anchor_equity')
+                    self.day_anchor_date = saved.get('day_anchor_date')
                     self.started_at = saved.get('started_at', self.started_at)
                     self.last_retrain_at = saved.get('last_retrain_at')
             except (json.JSONDecodeError, OSError):
@@ -270,6 +293,8 @@ class LiveTrader:
                 mode=self.cfg.mode, interval=self.cfg.interval, positions=self.positions,
                 pending=self.pending, cooldowns=self.cooldowns, retry_after=self.retry_after,
                 cash=self.cash, baseline_equity=self.baseline_equity, baseline_set_at=self.baseline_set_at,
+                day_anchor_equity=self.day_anchor_equity, day_anchor_date=self.day_anchor_date,
+                daily_return=self.daily_return,
                 started_at=self.started_at, last_tick_at=self.last_tick_at, last_refresh_at=self.last_refresh_at,
                 last_retrain_at=self.last_retrain_at, last_error=self.last_error), f, indent=2)
             f.flush()
@@ -304,6 +329,13 @@ class LiveTrader:
         external = self._cached_external_flow() if self.cfg.mode != 'paper' else 0.
         adjusted = equity - external
         ret = adjusted / self.baseline_equity - 1 if self.baseline_equity else 0.
+        today = datetime.now(timezone.utc).date().isoformat()
+        if self.day_anchor_date != today:
+            # New UTC day (or first observation ever): the Daily MDD breaker measures drawdown
+            # from *today's* starting equity, not the all-time baseline above.
+            self.day_anchor_equity = adjusted
+            self.day_anchor_date = today
+        self.daily_return = adjusted / self.day_anchor_equity - 1 if self.day_anchor_equity else 0.
         with self.equity_path.open('a') as f:
             f.write(f'{datetime.now(timezone.utc).isoformat()},{equity:.2f},{ret:.6f}\n')
         return ret
@@ -718,6 +750,11 @@ class LiveTrader:
         self.multiframe_decisions = {}
         exited = set()
         buy_candidates = []
+        # Daily MDD circuit breaker: once today's (UTC) equity has fallen DAILY_MDD_LIMIT from
+        # its start-of-day anchor, stop opening new positions for the rest of the day. Existing
+        # positions still get their normal protective exits (stop/target/horizon/multiframe) --
+        # this only ever suppresses new entries, never blocks an exit.
+        halted = self.daily_return is not None and self.daily_return <= -DAILY_MDD_LIMIT
         for market in priority:
             held = market in self.positions
             book = feed['books'].get(market)
@@ -735,7 +772,7 @@ class LiveTrader:
                 try:
                     fallback = hourly_only(records.get(market, {}), book, time.time(),
                                 max(minimum_entry(), min(self.cash, self.cfg.max_krw_per_trade)),
-                                self.cfg.entry_threshold)
+                                self.cfg.partial_entry_threshold)
                 except (ValueError, TypeError, KeyError, ZeroDivisionError):
                     fallback = None
                 if fallback and fallback.get('complete'):
@@ -770,9 +807,13 @@ class LiveTrader:
                         break
                 else:
                     self._log_decision(market, 'STAY', decision['reason'], dict(multiframe=public))
+            elif halted and not held:
+                public.update(action='STAY', reason=f'Daily MDD 서킷브레이커: 당일 {self.daily_return:.2%} 손실, 신규 매수 중단')
+                self.multiframe_decisions[market] = public
+                self._log_decision(market, 'STAY', public['reason'], dict(multiframe=public))
             elif decision['action']=='BUY' and budget:
                 buy_candidates.append((market, decision, False))
-            elif not held and partial_budget(decision, self.cash, self.cfg.max_krw_per_trade, self.cfg.entry_threshold):
+            elif not held and partial_budget(decision, self.cash, self.cfg.max_krw_per_trade, self.cfg.partial_entry_threshold):
                 # The strict three-frame gate declined, but the hourly edge alone is still
                 # solidly positive -- the ranking table already reports this return as positive.
                 # Take it, just smaller (see multiframe.partial_budget).
@@ -798,7 +839,7 @@ class LiveTrader:
             current = self.runtime.stream.snapshot()
             book = current['books'].get(market)
             def size(d, partial_size):
-                return partial_budget(d, self.cash, self.cfg.max_krw_per_trade, self.cfg.entry_threshold) \
+                return partial_budget(d, self.cash, self.cfg.max_krw_per_trade, self.cfg.partial_entry_threshold) \
                     if partial_size else buy_budget(d, self.cash, self.cfg.max_krw_per_trade)
             budget = size(decision, partial)
             if not budget:
@@ -813,18 +854,24 @@ class LiveTrader:
                 # hourly edge has changed.
                 try:
                     fallback = hourly_only(records.get(market, {}), book, time.time(), budget,
-                                           self.cfg.entry_threshold)
+                                           self.cfg.partial_entry_threshold)
                 except (ValueError, TypeError, KeyError, ZeroDivisionError):
                     fallback = None
                 if fallback and fallback.get('complete'):
                     decision = fallback
             if decision['action'] == 'BUY':
                 partial = False  # reconfirmed at full conviction -- size and log it as such
-            elif not (partial and partial_qualifies(decision, self.cfg.entry_threshold)):
+            elif not (partial and partial_qualifies(decision, self.cfg.partial_entry_threshold)):
                 self.multiframe_decisions[market].update(action='STAY', reason=decision['reason'])
                 continue
             budget = min(budget, size(decision, partial))
             if not budget:
+                continue
+            record = records.get(market, {}).get(self.cfg.interval, {})
+            self.multiframe_decisions[market]['forecast_uncertainty'] = record.get('forecast_uncertainty')
+            blocked, uncertainty_reason = too_uncertain(record, self.cfg.analog_max_uncertainty)
+            if blocked:
+                self.multiframe_decisions[market].update(action='STAY', reason=uncertainty_reason)
                 continue
             if self.cfg.analog_gate_enabled:
                 # Final confirmation: only downgrades a BUY the rules already approved to STAY,
@@ -835,7 +882,7 @@ class LiveTrader:
                 # yet, so the gate stays a no-op (visible in multiframe_decisions, never blocking)
                 # until enough same-symbol horizon-apart pairs have accumulated on their own --
                 # no restart needed once the analog database is finally worth trusting.
-                vector = feature_vector(records.get(market, {}).get(self.cfg.interval, {}))
+                vector = feature_vector(record)
                 signal = analog_signal(vector, self._analog_db(), k=self.cfg.analog_k)
                 self.multiframe_decisions[market]['analog_signal'] = signal
                 if signal['n'] >= self.cfg.analog_min_n:
@@ -897,7 +944,9 @@ class LiveTrader:
                         last_tick_duration=self.last_tick_duration,
                         cooldowns=self.cooldowns, retry_after=self.retry_after, started_at=self.started_at,
                         last_tick_at=self.last_tick_at, last_refresh_at=self.last_refresh_at,
-                        last_retrain_at=self.last_retrain_at, last_error=self.last_error)
+                        last_retrain_at=self.last_retrain_at, last_error=self.last_error,
+                        daily_return=self.daily_return, daily_mdd_limit=DAILY_MDD_LIMIT,
+                        daily_halted=bool(self.daily_return is not None and self.daily_return <= -DAILY_MDD_LIMIT))
 
     # ---- background loops ----
     def _tick_loop(self):
@@ -977,7 +1026,8 @@ class LiveTrader:
                            check=True, timeout=300, env=env)
             subprocess.run([str(venv_python), '-m', 'prop_trader.timesfm_run',
                              '--csv', f'data/current/{interval}.csv', '--out', str(tmp_dir),
-                             '--interval', interval, '--rolling-split', '--horizon', '5'],
+                             '--interval', interval, '--rolling-split', '--horizon', '5',
+                             '--device', 'cpu'],  # keep the GPU free for live MPS inference during retrain
                             check=True, timeout=10800, env=env)
             if not (tmp_dir / 'adapter' / 'adapter_model.safetensors').exists():
                 raise RuntimeError('training finished without an adapter checkpoint')
@@ -1057,6 +1107,7 @@ def main():
     p.add_argument('--max-krw', type=float, default=float(os.environ.get('UPBIT_MAX_ORDER_KRW', 10000)))
     p.add_argument('--paper-capital', type=float, default=1_000_000.)
     p.add_argument('--entry-threshold', type=float, default=ENTRY_THRESHOLD, help='Minimum expected net return to enter (0 = any post-cost-positive edge)')
+    p.add_argument('--partial-entry-threshold', type=float, default=0.01, help='Minimum hourly-only expected return required for a partial-conviction (missing 1m/1d confirmation) entry; kept much stricter than --entry-threshold since that path historically has a materially lower win rate')
     p.add_argument('--universe-top', type=int, default=12, help='How many top-24h-volume KRW markets to rank each refresh (max 30)')
     p.add_argument('--retrain-seconds', type=int, default=86400, help='Legacy option; backbone retraining is offline while resident inference runs')
     p.add_argument('--no-daily-retrain', action='store_true', help='Compatibility option; concurrent backbone retraining is disabled for resident mode')
@@ -1064,16 +1115,18 @@ def main():
     p.add_argument('--analog-min-n', type=int, default=15, help='Minimum historical analogs required to trust the analog signal')
     p.add_argument('--analog-min-win-rate', type=float, default=0.55, help='Minimum win rate among historical analogs to confirm a BUY')
     p.add_argument('--analog-k', type=int, default=30, help='How many nearest historical analogs to average')
+    p.add_argument('--analog-max-uncertainty', type=float, default=None, help='Block a BUY when TimesFM native quantile spread ((q90-q10)/anchor at horizon) exceeds this; unset (default) leaves forecast_uncertainty purely observational, independent of --analog-gate')
     args = p.parse_args()
     if args.mode == 'live' and not args.confirm_live:
         p.error('실거래 주문을 실행하려면 --mode live 와 함께 --confirm-live 를 명시해야 합니다.')
     cfg = LiveConfig(interval=args.interval, mode=args.mode, tick_seconds=args.tick_seconds,
                       refresh_seconds=args.refresh_seconds, max_positions=args.max_positions,
                       max_krw_per_trade=args.max_krw, paper_capital=args.paper_capital,
-                      entry_threshold=args.entry_threshold, universe_top=args.universe_top,
+                      entry_threshold=args.entry_threshold, partial_entry_threshold=args.partial_entry_threshold,
+                      universe_top=args.universe_top,
                       retrain_seconds=args.retrain_seconds, analog_gate_enabled=args.analog_gate,
                       analog_min_n=args.analog_min_n, analog_min_win_rate=args.analog_min_win_rate,
-                      analog_k=args.analog_k)
+                      analog_k=args.analog_k, analog_max_uncertainty=args.analog_max_uncertainty)
     trader = LiveTrader(cfg)
     trader.start(retrain=not args.no_daily_retrain)
     print(f'live-trader started: mode={cfg.mode} interval={cfg.interval} tick={cfg.tick_seconds}s refresh={cfg.refresh_seconds}s')

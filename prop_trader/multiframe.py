@@ -92,15 +92,15 @@ def partial_qualifies(decision, threshold):
 
 
 def partial_budget(decision, cash, cap, threshold=.002):
-    """Lower-conviction sizing: roughly half of what a confirmed three-frame signal at the same
-    strength would get, but never below the exchange's practical minimum notional -- halving an
-    already-small cap can fall under that minimum, which would make "smaller" mean "never
-    actually tradeable." Capped by `cap` itself (never buy_budget's own ceiling a second time --
-    that previously made ANY strength below ~0.46 collapse to zero even with a solid edge, since
-    half of that ceiling routinely undercut the floor while the ceiling itself still could not).
-    On a small account this can collapse to exactly the minimum regardless of strength; that's
-    correct, not a bug -- there is no room to grade between "the smallest possible trade" and
-    "no trade" when the full-size cap itself is small.
+    """Lower-conviction sizing: takes half of whatever headroom exists between the exchange's
+    practical minimum notional and what a confirmed three-frame signal at the same strength
+    would get (buy_budget's own amount), so it always sizes strictly below a full-conviction
+    trade yet still grades with strength -- never a flat cap*(.35+.65*strength)*.5 ceiling, which
+    tops out at cap*0.5 regardless of strength and silently pins EVERY partial trade to the exact
+    minimum whenever cap*0.5 <= floor (true for any cap below ~2x the floor, e.g. an 8000 cap
+    against a ~5190 floor: cap*0.5=4000 < floor always, so the old formula's max(floor,
+    half_ceiling) was floor unconditionally -- reported live 2026-09-11, every partial fill sized
+    identically regardless of signal strength).
     """
     from .execution_rules import minimum_entry
     if not partial_qualifies(decision, threshold):
@@ -109,8 +109,9 @@ def partial_budget(decision, cash, cap, threshold=.002):
     if not math.isfinite(strength):
         return 0.
     floor = minimum_entry()
-    half_ceiling = cap*(.35+.65*max(0., min(1., strength)))*.5
-    amount = min(cash*.9, cap, max(floor, half_ceiling))
+    full = cap*(.35+.65*max(0., min(1., strength)))  # what buy_budget would size at this strength
+    headroom = max(0., full-floor)
+    amount = min(cash*.9, cap, floor+headroom*.5)
     return amount if amount >= floor else 0.
 
 

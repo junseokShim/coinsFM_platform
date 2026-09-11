@@ -27,6 +27,7 @@ def request(endpoint,params=None):
 def main():
     p=argparse.ArgumentParser();p.add_argument('--out',type=Path,default=Path('data/current'))
     p.add_argument('--count',type=int,default=800)
+    p.add_argument('--symbols',nargs='+',default=SYMBOLS,help='Override the default 6-symbol research universe, e.g. for a matched-symbol comparison against another data source')
     args=p.parse_args()
     if not 256<=args.count<=999:raise ValueError('count must be 256..999')
     server,_=request('time');cutoff=server['serverTime']
@@ -43,7 +44,7 @@ def main():
         return interval,[[datetime.fromtimestamp(r[0]/1000,timezone.utc).isoformat(),symbol,*r[1:6]] for r in raw],dict(url=url,sha256=digest,symbol=symbol,interval=interval)
     data={k:[] for k in INTERVALS};sources=[]
     with ThreadPoolExecutor(max_workers=3) as pool:
-        for interval,rows,meta in pool.map(fetch,[(i,s) for i in INTERVALS for s in SYMBOLS]):
+        for interval,rows,meta in pool.map(fetch,[(i,s) for i in INTERVALS for s in args.symbols]):
             data[interval].extend(rows);sources.append(meta)
     for interval,rows in data.items():
         rows.sort(key=lambda r:(r[0],r[1]))
@@ -53,7 +54,7 @@ def main():
     (args.out/'manifest.json').write_text(json.dumps(dict(cutoff_ms=cutoff,
         cutoff_utc=datetime.fromtimestamp(cutoff/1000,timezone.utc).isoformat(),sources=sources,
         files={i:hashlib.sha256((args.out/f'{i}.csv').read_bytes()).hexdigest() for i in data}),indent=2))
-    print('Saved 3 intervals, 6 symbols,',args.count,'completed candles each')
+    print(f'Saved {len(INTERVALS)} intervals, {len(args.symbols)} symbols,',args.count,'completed candles each')
 
 
 if __name__=='__main__':main()

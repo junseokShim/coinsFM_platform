@@ -90,6 +90,18 @@ class MultiFrameTests(unittest.TestCase):
         d=dict(action='STAY',complete=True,returns={'1h':.0272},signal_strength=.347)
         self.assertGreaterEqual(partial_budget(d,76232.,8000,0),5000)
 
+    def test_partial_budget_actually_scales_with_strength_at_small_cap(self):
+        # Regression: cap*(.35+.65*strength)*.5 tops out at cap*0.5, which never clears the
+        # exchange floor at an 8000 cap (cap*0.5=4000 < floor~5190) -- every partial trade sized
+        # identically at the flat minimum no matter how strong the signal was (reported live
+        # 2026-09-11: every partial fill was ~5187 krw regardless of strength).
+        weak=dict(action='STAY',complete=True,returns={'1h':.0272},signal_strength=.1)
+        strong=dict(weak,signal_strength=.9)
+        weak_amount=partial_budget(weak,100000.,8000,0)
+        strong_amount=partial_budget(strong,100000.,8000,0)
+        self.assertGreater(strong_amount,weak_amount)
+        self.assertGreater(strong_amount,5500)  # meaningfully above the flat floor, not pinned
+
     def test_hourly_only_reads_the_hourly_frame_without_needing_1m_or_1d(self):
         rows=frames();del rows['1d'];del rows['1m']  # only 1h left, as for a thinly-traded market
         d=hourly_only(rows,live_book(),time.time(),8000)
@@ -156,6 +168,32 @@ class ResidentScheduleTests(unittest.TestCase):
             opening_price=1,high_price=1,low_price=1,trade_price=1,candle_acc_trade_volume=1)]
         cutoff=datetime(2026,9,10,1,tzinfo=timezone.utc).timestamp()
         with self.assertRaises(ValueError):completed_bars(client,'KRW-BTC','1h',cutoff)
+
+
+class DailyAnchorTests(unittest.TestCase):
+    setUp = fixtures.TraderSafetyTests.setUp
+    request = fixtures.TraderSafetyTests.request
+    trader = fixtures.TraderSafetyTests.trader
+
+    def test_first_observation_anchors_at_zero(self):
+        t=self.trader()
+        t._append_equity(100000.)
+        self.assertEqual(t.daily_return,0.)
+        self.assertEqual(t.day_anchor_equity,100000.)
+
+    def test_same_day_drawdown_measured_from_anchor(self):
+        t=self.trader()
+        t._append_equity(100000.)
+        t._append_equity(97000.)
+        self.assertAlmostEqual(t.daily_return,-0.03)
+
+    def test_new_day_resets_anchor(self):
+        t=self.trader()
+        t._append_equity(100000.)
+        t.day_anchor_date='2000-01-01'  # force the next call to see a "new" UTC day
+        t._append_equity(50000.)
+        self.assertEqual(t.daily_return,0.)
+        self.assertEqual(t.day_anchor_equity,50000.)
 
 
 class RealtimeIntegrationTests(unittest.TestCase):
@@ -239,6 +277,32 @@ class RealtimeIntegrationTests(unittest.TestCase):
         t.runtime=runtime;t.tick()
         self.assertFalse(t.positions)
 
+    def test_daily_mdd_breaker_blocks_new_buys(self):
+        t=self.trader();runtime=Mock()
+        runtime.stream.snapshot.return_value=dict(connected=True,error=None,books={'KRW-BTC':live_book()},
+            tickers={'KRW-BTC':dict(market='KRW-BTC',trade_price=100,acc_trade_price_24h=100000)})
+        runtime.forecasts.return_value=dict(records={'KRW-BTC':frames()})  # would otherwise BUY
+        t.runtime=runtime
+        t.daily_return=-0.05  # already past the -3% breaker
+        t.tick()
+        self.assertFalse(t.positions)
+        self.assertEqual(t.multiframe_decisions['KRW-BTC']['action'],'STAY')
+        self.assertIn('Daily MDD',t.multiframe_decisions['KRW-BTC']['reason'])
+
+    def test_daily_mdd_breaker_does_not_block_existing_position_exit(self):
+        t=self.trader();runtime=Mock()
+        runtime.stream.snapshot.return_value=dict(connected=True,error=None,books={'KRW-BTC':live_book()},
+            tickers={'KRW-BTC':dict(market='KRW-BTC',trade_price=100,acc_trade_price_24h=100000)})
+        runtime.forecasts.return_value=dict(records={'KRW-BTC':frames()})
+        t.runtime=runtime;t.tick()
+        self.assertIn('KRW-BTC',t.positions)
+        # Now the daily breaker trips AND the multiframe signal turns to SELL (daily frame
+        # vetoes hold). The held position must still exit -- the breaker only suppresses entries.
+        t.daily_return=-0.05
+        runtime.forecasts.return_value=dict(records={'KRW-BTC':frames(day=99)})
+        t.tick()
+        self.assertFalse(t.positions)
+
 
 def full_technical(**overrides):
     values=dict(rsi14=55.,macd_hist=.1,atr14=.01,bb_position=.5,ema_gap=.01,adx14=20.,
@@ -296,6 +360,46 @@ class AnalogGateIntegrationTests(unittest.TestCase):
     def test_allows_once_enough_good_analogs(self):
         t=self.trader()
         self.tick_with_db(t,[self.analog_row(.05) for _ in range(5)])  # 5 >= min_n, all winners
+        self.assertIn('KRW-BTC',t.positions)
+
+
+class UncertaintyGateIntegrationTests(unittest.TestCase):
+    """analog_max_uncertainty needs no accumulated history -- unlike the analog gate above, it
+    must be able to block (or stay a no-op) on the very first tick."""
+    setUp = fixtures.TraderSafetyTests.setUp
+    request = fixtures.TraderSafetyTests.request
+
+    def trader(self, analog_max_uncertainty):
+        cfg=LiveConfig(mode='paper',max_krw_per_trade=8000,analog_max_uncertainty=analog_max_uncertainty)
+        t=LiveTrader(cfg,self.client)
+        t.journal_path=self.root/'orders.sqlite'
+        return t
+
+    def tick_with_uncertainty(self, t, uncertainty):
+        runtime=Mock()
+        runtime.stream.snapshot.return_value=dict(connected=True,error=None,books={'KRW-BTC':live_book()},
+            tickers={'KRW-BTC':dict(market='KRW-BTC',trade_price=100,acc_trade_price_24h=100000)})
+        rows=frames()
+        rows['1h']['forecast_uncertainty']=uncertainty
+        runtime.forecasts.return_value=dict(records={'KRW-BTC':rows})
+        t.runtime=runtime
+        t.tick()
+
+    def test_unset_threshold_never_blocks(self):
+        t=self.trader(None)
+        self.tick_with_uncertainty(t,.5)  # would be huge if a threshold were set
+        self.assertIn('KRW-BTC',t.positions)
+
+    def test_blocks_when_uncertainty_exceeds_threshold(self):
+        t=self.trader(.05)
+        self.tick_with_uncertainty(t,.08)
+        self.assertNotIn('KRW-BTC',t.positions)
+        self.assertEqual(t.multiframe_decisions['KRW-BTC']['action'],'STAY')
+        self.assertIn('불확실성',t.multiframe_decisions['KRW-BTC']['reason'])
+
+    def test_allows_when_uncertainty_under_threshold(self):
+        t=self.trader(.05)
+        self.tick_with_uncertainty(t,.01)
         self.assertIn('KRW-BTC',t.positions)
 
 

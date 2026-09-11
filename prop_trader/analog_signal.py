@@ -131,6 +131,22 @@ def analog_signal(current_vector, db, k=30):
                 mean_return=sum(returns) / n, median_return=median)
 
 
+def too_uncertain(record, max_uncertainty):
+    """True when TimesFM's own native quantile spread (record['forecast_uncertainty'] --
+    (q90-q10)/anchor at the forecast horizon, see timesfm_predict.predict_symbol) is too wide to
+    trust. Missing/older records (no quantile output yet) are never flagged here -- fail open,
+    consistent with every other gate in this module only ever downgrading a BUY it can actually
+    evaluate, never blocking on absence of data."""
+    uncertainty = record.get('forecast_uncertainty')
+    if uncertainty is None or max_uncertainty is None:
+        return False, None
+    if not math.isfinite(uncertainty):
+        return False, None
+    if uncertainty > max_uncertainty:
+        return True, f"예측 불확실성 과다({uncertainty:.2%} > 기준 {max_uncertainty:.2%})"
+    return False, None
+
+
 def confirms_buy(signal, min_win_rate=0.55, min_mean_return=0., min_n=15):
     """Pure gate. Refuses to vouch on a thin sample rather than pretending confidence, and
     only confirms when the historical analogs actually agree this setup has worked out."""

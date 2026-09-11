@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from prop_trader.analog_signal import (
-    feature_vector, build_analog_db, nearest_analogs, analog_signal, confirms_buy, FEATURE_NAMES,
+    feature_vector, build_analog_db, nearest_analogs, analog_signal, confirms_buy, too_uncertain, FEATURE_NAMES,
 )
 from prop_trader.technical import FEATURES
 
@@ -139,6 +139,32 @@ class ConfirmsBuyTests(unittest.TestCase):
         ok, reason = confirms_buy(dict(n=20, win_rate=.7, mean_return=.02))
         self.assertTrue(ok)
         self.assertIn('20개', reason)
+
+
+class TooUncertainTests(unittest.TestCase):
+    def test_unset_threshold_never_blocks(self):
+        blocked, reason = too_uncertain(dict(forecast_uncertainty=.5), None)
+        self.assertFalse(blocked)
+        self.assertIsNone(reason)
+
+    def test_missing_uncertainty_never_blocks(self):
+        blocked, reason = too_uncertain({}, .05)
+        self.assertFalse(blocked)
+        self.assertIsNone(reason)
+
+    def test_non_finite_uncertainty_never_blocks(self):
+        blocked, reason = too_uncertain(dict(forecast_uncertainty=float('nan')), .05)
+        self.assertFalse(blocked)
+
+    def test_blocks_when_over_threshold(self):
+        blocked, reason = too_uncertain(dict(forecast_uncertainty=.08), .05)
+        self.assertTrue(blocked)
+        self.assertIn('불확실성', reason)
+
+    def test_allows_when_under_threshold(self):
+        blocked, reason = too_uncertain(dict(forecast_uncertainty=.02), .05)
+        self.assertFalse(blocked)
+        self.assertIsNone(reason)
 
 
 if __name__ == '__main__':

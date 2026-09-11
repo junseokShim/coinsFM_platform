@@ -200,6 +200,7 @@ def main():
     p.add_argument('--max-krw', type=float, default=float(os.environ.get('UPBIT_MAX_ORDER_KRW', 10000)))
     p.add_argument('--paper-capital', type=float, default=1_000_000.)
     p.add_argument('--entry-threshold', type=float, default=0.002, help='Minimum expected net return to enter (0 = any post-cost-positive edge)')
+    p.add_argument('--partial-entry-threshold', type=float, default=0.01, help='Minimum hourly-only expected return required for a partial-conviction (missing 1m/1d confirmation) entry; kept much stricter than --entry-threshold since that path historically has a materially lower win rate')
     p.add_argument('--universe-top', type=int, default=12, help='How many top-24h-volume KRW markets to rank each refresh (max 30)')
     p.add_argument('--retrain-seconds', type=int, default=86400, help='Legacy option; backbone retraining is offline while resident inference runs')
     p.add_argument('--no-daily-retrain', action='store_true', help='Compatibility option; concurrent backbone retraining is disabled for resident mode')
@@ -207,6 +208,7 @@ def main():
     p.add_argument('--analog-min-n', type=int, default=15, help='Minimum historical analogs required to trust the analog signal')
     p.add_argument('--analog-min-win-rate', type=float, default=0.55, help='Minimum win rate among historical analogs to confirm a BUY')
     p.add_argument('--analog-k', type=int, default=30, help='How many nearest historical analogs to average')
+    p.add_argument('--analog-max-uncertainty', type=float, default=None, help='Block a BUY when TimesFM native quantile spread ((q90-q10)/anchor at horizon) exceeds this; unset (default) leaves forecast_uncertainty purely observational, independent of --analog-gate')
     args = p.parse_args()
     if args.mode == 'live' and not args.confirm_live:
         p.error('실거래 주문을 실행하려면 --mode live 와 함께 --confirm-live 를 명시해야 합니다.')
@@ -215,10 +217,11 @@ def main():
     cfg = LiveConfig(interval=args.interval, mode=args.mode, tick_seconds=args.tick_seconds,
                       refresh_seconds=args.refresh_seconds, max_positions=args.max_positions,
                       max_krw_per_trade=args.max_krw, paper_capital=args.paper_capital,
-                      entry_threshold=args.entry_threshold, universe_top=args.universe_top,
+                      entry_threshold=args.entry_threshold, partial_entry_threshold=args.partial_entry_threshold,
+                      universe_top=args.universe_top,
                       retrain_seconds=args.retrain_seconds, analog_gate_enabled=args.analog_gate,
                       analog_min_n=args.analog_min_n, analog_min_win_rate=args.analog_min_win_rate,
-                      analog_k=args.analog_k)
+                      analog_k=args.analog_k, analog_max_uncertainty=args.analog_max_uncertainty)
     trader = LiveTrader(cfg)
     trader.start(retrain=not args.no_daily_retrain)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(trader))
