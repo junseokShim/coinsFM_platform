@@ -25,6 +25,16 @@ HF_HOME="$PWD/.cache/huggingface" HF_HUB_OFFLINE=1 .venv-timesfm/bin/python -m p
 
 결과는 `runs/hybrid/REPORT.md`. 이 기간은 기존 연구에서 이미 확인했으므로 **새로운 미관측 holdout이 아닙니다**. 기술적 지표의 추가가 성능 향상을 보장하지 않습니다. Binance 데이터의 결과를 업비트 실거래 검증으로 주장하지 않습니다. MDD는 봉 시가 평가 기준이며, 봉 내부 손절·호가 충격·펀딩비는 시뮬레이션하지 않습니다. 기존 Claude 구현의 `backtest_forecast.py`는 신호별 단순 손익 분석으로 그대로 보존합니다.
 
+## 청산 규칙 탐색 (익절/손절)
+
+`live_trader.py`의 `STOP_FRACTION=2.5%, REWARD_MULTIPLE=1`(2.5% 익절)은 라이브 거래 29건의 실현폭을 한 번 보고 정한 값이며 백테스트로 검증되지 않았다. `exit_sweep.py`는 `eval_predictions.csv`(배포 모델 `lora_fewshot`)를 실제 캔들 고가/저가와 결합해 동일 봉 내 손절 우선·갭 시가 체결 규칙(`engine.Desk.step`과 동일)으로 실제 익절 도달 여부를 시뮬레이션하고, 고정 stop/target 그리드와 CoinsFM 예측경로 기반 적응형 목표가(예측 최고가 × shrink)를 확장형 walk-forward 교차검증으로 비교한다.
+
+```sh
+python3 -m prop_trader.exit_sweep
+```
+
+결과: `runs/forecast5/EXIT_SWEEP_REPORT.md`, 주기별 `runs/forecast5/{interval}/exit_sweep.json`. 진입 게이트를 통과하는 표본이 주기당 한 자릿수~10여 건으로 작아 결과는 참고용이다. 1m은 진입 게이트를 통과하는 구간이 사실상 없다(`BACKTEST_REPORT.md`의 1m 무신호 결과와 일치). 1d 표본외 결과에서는 어떤 고정 익절 값(현재 라이브 값 포함)도 "익절 없음, 손절+만료만"보다 못했다 — 익절 자체가 현재 형태로는 도움이 안 될 수 있다는 신호이며, 값 하나를 바꾼다고 해결되지 않을 수 있다. 여기서 나온 어떤 설정도 `live_server.py --mode paper`로 먼저 모의 검증한 뒤에만 실거래 상수를 바꿔야 한다.
+
 ## 예상 순수익률 순위
 
 ```sh

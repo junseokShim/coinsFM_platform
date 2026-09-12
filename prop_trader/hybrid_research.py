@@ -3,6 +3,7 @@ import argparse
 import csv
 import hashlib
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from collections import defaultdict
 
@@ -15,6 +16,7 @@ from .forecast_time import SECONDS
 from .timesfm_run import windows
 from .evaluator import fewshot_forecast, horizon_metrics, momentum_forecast, write_predictions
 from .technical import FEATURES, feature_frame, HybridCalibrator
+from .downstream import RidgeHead, head_features, uncertainty_targets, volatility_targets
 from .reliable_backtest import portfolio
 
 
@@ -85,6 +87,26 @@ def evaluate(interval, source=Path('data/current'), root=Path('runs/forecast5'),
         reference_ta_source='ta/ta (checked-in 0.11.0)',
         training_data_sha256=signature['data_sha256'],deployment_status='research_unverified')
     (out/'calibrator.json').write_text(json.dumps(artifact,indent=2))
+    # Two more downstream heads, same validation-only fit and hash lock as the calibrator above,
+    # but predicting conviction/risk sizing rather than correcting the price path -- see
+    # downstream.py's module docstring.
+    ema_gap_idx=FEATURES.index('ema_gap')
+    trend_agree=np.sign(vx[:,ema_gap_idx])*np.sign(val_raw[:,-1])
+    head_x=np.concatenate([val_raw,vx,trend_agree[:,None]],axis=1)
+    delta=timedelta(seconds=SECONDS[interval])
+    val_anchors=np.array([r[2]['anchor'] for r in validation])
+    val_window_bars=[]
+    for _,_,meta in validation:
+        start=datetime.fromisoformat(meta['target_start'])
+        by_ts={b.timestamp:b for b in all_bars[meta['symbol']]}
+        val_window_bars.append([by_ts[(start+n*delta).isoformat()] for n in range(5)])
+    uncertainty_head=RidgeHead().fit(head_x,uncertainty_targets(val_raw,vy))
+    volatility_head=RidgeHead().fit(head_x,volatility_targets(val_anchors,val_window_bars))
+    head_meta=dict(interval=interval,horizon=5,calibration_end=artifact['calibration_end'],
+        training_data_sha256=signature['data_sha256'],feature_dim=head_x.shape[1],
+        deployment_status='research_unverified')
+    (out/'uncertainty_head.json').write_text(json.dumps(dict(model=uncertainty_head.to_dict(),**head_meta),indent=2))
+    (out/'volatility_head.json').write_text(json.dumps(dict(model=volatility_head.to_dict(),**head_meta),indent=2))
     predictions=dict(naive=np.zeros_like(ty),momentum=np.stack([momentum_forecast(r[0],5) for r in test]),
         timesfm_fewshot=test_raw,technical_only=technical.predict(np.zeros_like(test_raw),tx),
         hybrid=hybrid.predict(test_raw,tx))

@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock
 
-from prop_trader.multiframe import decide, buy_budget, exit_fraction, candidate_score, partial_qualifies, partial_budget, hourly_only
+from prop_trader.multiframe import decide, buy_budget, exit_fraction, candidate_score, partial_qualifies, partial_budget, hourly_only, too_correlated
 from prop_trader.market_stream import MarketStream
 from prop_trader.resident_forecasts import next_job, boundary, completed_bars
 from prop_trader.live_trader import LiveConfig, LiveTrader
@@ -62,6 +62,35 @@ class MultiFrameTests(unittest.TestCase):
         self.assertEqual(buy_budget(weak,100000,8000),0)
         self.assertEqual(exit_fraction(.5,80,100),1)
         self.assertEqual(exit_fraction(.5,200,100),.5)
+
+    def test_score_unaffected_when_no_uncertainty_head_yet(self):
+        rows=frames()
+        decision=decide(rows,live_book(),time.time(),8000)
+        self.assertEqual(decision['score'],decision['returns']['1h'])
+
+    def test_score_penalized_by_predicted_uncertainty(self):
+        rows=frames()
+        baseline=decide(rows,live_book(),time.time(),8000)['score']
+        rows['1h']['predicted_uncertainty']=.01
+        penalized=decide(rows,live_book(),time.time(),8000)['score']
+        self.assertAlmostEqual(baseline-penalized,.01,places=6)
+
+    def test_conviction_none_when_no_uncertainty_head_yet(self):
+        d=decide(frames(),live_book(),time.time(),8000)
+        self.assertIsNone(d['conviction'])
+
+    def test_conviction_is_return_over_predicted_error(self):
+        rows=frames()
+        rows['1h']['predicted_uncertainty']=.02
+        d=decide(rows,live_book(),time.time(),8000)
+        self.assertAlmostEqual(d['conviction'],d['returns']['1h']/.02,places=6)
+
+    def test_hourly_only_also_reports_conviction(self):
+        rows=frames();del rows['1d'];del rows['1m']
+        rows['1h']['predicted_uncertainty']=.02
+        d=hourly_only(rows,live_book(),time.time(),8000)
+        self.assertAlmostEqual(d['conviction'],d['returns']['1h']/.02,places=6)
+
 
     def test_partial_qualifies_when_hourly_alone_is_positive(self):
         d=self.decision(day=99)  # daily vetoes the full gate, hourly edge is still strongly positive
@@ -134,6 +163,62 @@ class MultiFrameTests(unittest.TestCase):
         self.assertEqual(candidate_score({}), 0.)
         self.assertEqual(candidate_score(dict(acc_trade_price_24h='not-a-number')), 0.)
         self.assertEqual(candidate_score(dict(acc_trade_price_24h=-5, signed_change_rate=.1)), 0.)
+
+
+class SizingScaleTests(unittest.TestCase):
+    def test_buy_budget_uses_conviction_when_present(self):
+        low=dict(action='BUY',complete=True,conviction=0.3)   # well under CONVICTION_REFERENCE=3.0
+        high=dict(action='BUY',complete=True,conviction=6.0)  # saturates at scale=1
+        self.assertLess(buy_budget(low,100000,20000),buy_budget(high,100000,20000))
+        self.assertEqual(buy_budget(high,100000,20000),20000*1.0)
+
+    def test_buy_budget_falls_back_to_signal_strength_without_conviction(self):
+        d=dict(action='BUY',complete=True,signal_strength=.5)
+        self.assertAlmostEqual(buy_budget(d,100000,20000),20000*(.35+.65*.5))
+
+    def test_buy_budget_rejects_nonfinite_conviction(self):
+        d=dict(action='BUY',complete=True,conviction=float('nan'))
+        self.assertEqual(buy_budget(d,100000,20000),0.)
+
+    def test_buy_budget_rejects_nonfinite_signal_strength_without_conviction(self):
+        d=dict(action='BUY',complete=True,signal_strength=float('nan'))
+        self.assertEqual(buy_budget(d,100000,20000),0.)
+
+    def test_higher_cap_widens_sizing_range(self):
+        weak=dict(action='BUY',complete=True,conviction=0.)
+        strong=dict(action='BUY',complete=True,conviction=6.0)
+        narrow=buy_budget(strong,100000,8000)-buy_budget(weak,100000,8000)
+        wide=buy_budget(strong,100000,20000)-buy_budget(weak,100000,20000)
+        self.assertGreater(wide,narrow)
+
+    def test_partial_budget_uses_conviction_and_stays_below_full(self):
+        d=dict(complete=True,action='STAY',returns={'1h':.01},conviction=6.0)
+        full=buy_budget(dict(d,action='BUY'),100000,20000)
+        partial=partial_budget(d,100000,20000,.002)
+        self.assertGreater(partial,0);self.assertLess(partial,full)
+
+
+class TooCorrelatedTests(unittest.TestCase):
+    def test_no_held_positions_never_blocks(self):
+        blocked,_=too_correlated([100,101,102,103,101,100,99,101,102,103,104],[])
+        self.assertFalse(blocked)
+
+    def test_too_little_history_never_blocks(self):
+        blocked,_=too_correlated([100,101],[[100,101,102,103,104,105,106,107,108,109,110]])
+        self.assertFalse(blocked)
+
+    def test_perfectly_correlated_candidate_blocked(self):
+        held=[100,101,102,101,100,99,100,101,102,103,104]
+        candidate=[50,50.5,51,50.5,50,49.5,50,50.5,51,51.5,52]  # same shape, half the price
+        blocked,reason=too_correlated(candidate,[held])
+        self.assertTrue(blocked)
+        self.assertIn('상관계수',reason)
+
+    def test_uncorrelated_candidate_not_blocked(self):
+        held=[100,101,102,101,100,99,100,101,102,103,104]
+        candidate=[100,99,101,98,103,97,105,96,107,95,109]  # noisy, unrelated path
+        blocked,_=too_correlated(candidate,[held])
+        self.assertFalse(blocked)
 
 
 class StreamTests(unittest.TestCase):
@@ -219,6 +304,25 @@ class RealtimeIntegrationTests(unittest.TestCase):
         runtime.forecasts.return_value=dict(records={'KRW-BTC':frames(day=99)})
         t.tick()
         self.assertFalse(t.positions)
+
+    def test_horizon_expires_is_the_forecasts_own_target_time_not_execution_time(self):
+        # Regression: horizon_expires must come from the 1h forecast's own as_of + 5 bars (its
+        # real target_end), not from when the BUY happened to execute. frames()'s as_of is
+        # boundary('1h', now) -- the start of the current hour, always earlier than the "now"
+        # execution actually reads (fresh_forecast requires origin<=now<origin+3600, so this gap
+        # exists at any point in the hour except exactly :00:00) -- so this alone already proves
+        # horizon_expires tracks the forecast's own origin, not the moment the BUY executed.
+        t=self.trader()
+        runtime=Mock()
+        runtime.stream.snapshot.return_value=dict(connected=True,error=None,books={'KRW-BTC':live_book()},
+            tickers={'KRW-BTC':dict(market='KRW-BTC',trade_price=100,acc_trade_price_24h=100000)})
+        origin=boundary('1h',time.time())
+        rows=frames()
+        runtime.forecasts.return_value=dict(records={'KRW-BTC':rows})
+        t.runtime=runtime
+        t.tick()
+        self.assertIn('KRW-BTC',t.positions)
+        self.assertEqual(t.positions['KRW-BTC']['horizon_expires'],origin+5*3600)
 
     def test_untracked_dust_with_no_ticker_does_not_block_equity_logging(self):
         # Regression: an untradeable holding with no active market (e.g. ETHW/ETHF/STRK -- a

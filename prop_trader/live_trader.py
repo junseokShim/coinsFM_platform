@@ -23,7 +23,7 @@ from .upbit_broker import UpbitClient, BrokerError, order_payload, submit, Order
 from .forecast_time import SECONDS
 from .execution_rules import timestamp, fresh_forecast, reprice, sell_quantity, minimum_entry, fills
 from .multiframe import (decide as decide_multiframe, buy_budget, exit_fraction, candidate_score,
-                          partial_qualifies, partial_budget, hourly_only)
+                          partial_qualifies, partial_budget, hourly_only, too_correlated)
 from .analog_signal import feature_vector, load_history, build_analog_db, analog_signal, confirms_buy, too_uncertain
 
 LIVE_ROOT = Path('runs/live')
@@ -37,6 +37,13 @@ def mode_paths(mode):
     root = LIVE_ROOT / mode
     return dict(state=root / 'state.json', equity=root / 'equity.csv', decisions=root / 'decisions.jsonl')
 
+# Fixed top-10-by-global-market-cap universe (stablecoins excluded), matching
+# download.SYMBOLS -- see that module's comment for how/when this list was derived. Replaces
+# the old dynamic top-N-by-24h-volume selection: concentrating the resident worker's few-shot
+# budget on 10 large, stable coins instead of spreading it across dozens of thin small-caps
+# (many of which never even had usable 1m data -- see the 2026-09-12 monitoring notes).
+TOP10_MARKETS = frozenset({'KRW-BTC', 'KRW-ETH', 'KRW-XRP', 'KRW-SOL', 'KRW-TRX',
+                            'KRW-DOGE', 'KRW-LINK', 'KRW-ADA', 'KRW-XLM', 'KRW-BCH'})
 ENTRY_THRESHOLD = 0.002   # matches the documented "0.2% after cost" entry gate
 DAILY_MDD_LIMIT = 0.03    # UTC-day drawdown from day-start equity that halts new entries
 STOP_FRACTION = 0.025     # matches engine.Config's backtested stop-loss
@@ -47,6 +54,18 @@ STOP_FRACTION = 0.025     # matches engine.Config's backtested stop-loss
 # to 5%. The old target was effectively decorative; 1 (2.5% take-profit, symmetric with the
 # stop) is reachable given this system's real volatility instead of only ever exiting on time.
 REWARD_MULTIPLE = 1
+STOP_FRACTION_BOUNDS = (0.01, 0.05)  # clip range for downstream.VolatilityHead's per-trade stop
+
+
+def _stop_fraction(predicted=None):
+    """Per-trade stop distance from downstream.VolatilityHead's predicted realized excursion,
+    clipped to a sane range; falls back to the fixed STOP_FRACTION when the head hasn't produced
+    a value yet (untrained, stale snapshot, or this position predates the head existing) --
+    exit_sweep.py's own walk-forward search never found a clearly better fixed constant, so the
+    fallback stays exactly what live already used rather than a second guess."""
+    if predicted is not None and math.isfinite(predicted) and predicted > 0:
+        return min(STOP_FRACTION_BOUNDS[1], max(STOP_FRACTION_BOUNDS[0], predicted))
+    return STOP_FRACTION
 FEE = 0.001
 SLIPPAGE = 0.001
 MIN_ORDER_KRW = 5000.     # Upbit's exchange-wide minimum notional for KRW markets
@@ -388,18 +407,21 @@ class LiveTrader:
 
     def _position(self, market, qty, funds, fee, intent):
         fill = funds / qty
+        frac = _stop_fraction(intent.get('predicted_stop_fraction'))
         return dict(symbol=market, qty=qty, entry_price=fill, cost_krw=funds+fee,
-                    entry_time=intent['created_at'], stop=fill*(1-STOP_FRACTION),
-                    target=fill*(1+STOP_FRACTION*REWARD_MULTIPLE),
+                    entry_time=intent['created_at'], stop=fill*(1-frac),
+                    target=fill*(1+frac*REWARD_MULTIPLE),
                     horizon_expires=intent['horizon_expires'], identifier=intent['identifier'],
-                    forecast_as_of=intent.get('forecast_as_of'), reconciled=True)
+                    forecast_as_of=intent.get('forecast_as_of'),
+                    predicted_stop_fraction=intent.get('predicted_stop_fraction'), reconciled=True)
 
     def _apply_buy_fill(self, market, qty, funds, fee, intent):
         """A second buy fill for an already-held market (e.g. a dust-rescue top-up, see
         _rescue_dust) accumulates into the existing position -- fee-inclusive weighted-average
         entry, stop/target rebased on it -- instead of overwriting it and silently losing track
-        of the coins already held. Keeps the original entry_time/horizon_expires/forecast_as_of:
-        a top-up doesn't reset how long the original bet has been running."""
+        of the coins already held. Keeps the original entry_time/horizon_expires/forecast_as_of
+        and predicted_stop_fraction: a top-up doesn't reset how long the original bet has been
+        running or restart risk sizing from a different forecast's estimate."""
         existing = self.positions.get(market)
         if not existing:
             self.positions[market] = self._position(market, qty, funds, fee, intent)
@@ -407,9 +429,10 @@ class LiveTrader:
         total_qty = existing['qty'] + qty
         total_cost = existing['cost_krw'] + funds + fee
         avg_price = total_cost / total_qty
+        frac = _stop_fraction(existing.get('predicted_stop_fraction'))
         self.positions[market] = dict(existing, qty=total_qty, cost_krw=total_cost, entry_price=avg_price,
-                                       stop=avg_price*(1-STOP_FRACTION),
-                                       target=avg_price*(1+STOP_FRACTION*REWARD_MULTIPLE), reconciled=True)
+                                       stop=avg_price*(1-frac),
+                                       target=avg_price*(1+frac*REWARD_MULTIPLE), reconciled=True)
 
     def _reconcile(self):
         """Pending orders block new submissions until terminal fills are durably applied.
@@ -509,7 +532,8 @@ class LiveTrader:
         intent = dict(identifier=identifier, market=market, side='buy', reason=reason,
                       created_at=self.started_tick_ts, forecast_as_of=rank_row['as_of'],
                       quote_expires=timestamp(rank_row['valid_until']),
-                      horizon_expires=timestamp(rank_row['as_of']) + SECONDS[self.cfg.interval]*5)
+                      horizon_expires=timestamp(rank_row['as_of']) + SECONDS[self.cfg.interval]*5,
+                      predicted_stop_fraction=rank_row.get('predicted_stop_fraction'))
         self._log_decision(market, 'BUY_INTENT', reason,
                            dict(identifier=identifier, forecast=rank_row, budget_krw=budget))
         if self.cfg.mode == 'paper':
@@ -723,15 +747,13 @@ class LiveTrader:
                     and not r.get('market_event', {}).get('warning', False)}
         feed = self.runtime.stream.snapshot()
         if now-self._priority_cache[0] > PRIORITY_REFRESH_SECONDS or not self._priority_cache[1]:
-            # Re-rank at most once a minute, not every tick. candidate_score folds in
-            # signed_change_rate, which jitters with every ticker update; re-selecting the
-            # top-N from that every 10s used to rotate a market out of the tracked set before
-            # the resident worker could even finish its 1m/1h/1d forecasts -- permanent "waiting
-            # for forecast," not caution. One re-rank per completed 1m bar still catches a pump
-            # within a minute, but gives each selection time to actually reach a decision.
-            liquid = sorted((r for m,r in feed['tickers'].items() if m in eligible),
+            # Universe is the fixed TOP10_MARKETS set, not a dynamic top-N-by-volume ranking
+            # (--universe-top no longer controls universe size, only compatibility). Still
+            # re-rank by candidate_score at most once a minute -- with only 10 symbols this
+            # mostly just decides refresh order, not which markets are ever considered at all.
+            liquid = sorted((r for m,r in feed['tickers'].items() if m in eligible and m in TOP10_MARKETS),
                             key=lambda r: -candidate_score(r))
-            self._priority_cache = (now, [r['market'] for r in liquid[:self.cfg.universe_top]])
+            self._priority_cache = (now, [r['market'] for r in liquid])
         selected = self._priority_cache[1]
         # Held coins first, then candidate_score rank (selected is already sorted by it).
         # Previously re-sorted by last-known signal_strength, defaulting an unevaluated market
@@ -879,6 +901,14 @@ class LiveTrader:
             if blocked:
                 self.multiframe_decisions[market].update(action='STAY', reason=uncertainty_reason)
                 continue
+            held_histories = [
+                [h['c'] for h in records.get(held, {}).get(self.cfg.interval, {}).get('history', [])]
+                for held in self.positions]
+            correlated, correlation_reason = too_correlated([h['c'] for h in record.get('history', [])],
+                                                             held_histories)
+            if correlated:
+                self.multiframe_decisions[market].update(action='STAY', reason=correlation_reason)
+                continue
             if self.cfg.analog_gate_enabled:
                 # Final confirmation: only downgrades a BUY the rules already approved to STAY,
                 # never the reverse. Uses the same technical-features record the multiframe
@@ -1006,15 +1036,18 @@ class LiveTrader:
             self._refresh_once()
 
     def _retrain_once(self):
-        """Daily LoRA fine-tune of the TimesFM backbone on the latest Binance candles.
+        """Daily LoRA fine-tune of the TimesFM backbone for all three frames (1m/1h/1d) on the
+        latest Binance candles. Live decisions use all three frames jointly (see
+        multiframe.decide) -- retraining only self.cfg.interval would leave two of three
+        forecasts permanently stale even though the backbone is nominally "kept fresh".
 
-        Isolated from the live 5-min ranking refresh: trains into a scratch directory, and only
-        swaps it into runs/forecast5/{interval} -- what the refresh loop actually reads -- after
-        training succeeds. The technical calibrator is keyed to the adapter's data hash, so it's
-        regenerated right after the swap; if that (or training) fails, the previous known-good
-        adapter+calibrator pair is restored so live trading never sees a broken model.
+        Each interval trains into its own scratch directory and only swaps into
+        runs/forecast5/{interval} -- what live inference actually reads -- after training
+        succeeds; one interval's failure does not block the others. The technical calibrator is
+        regenerated once for all three intervals together afterward (hybrid_research defaults to
+        all three); if that fails, every interval trained this cycle is rolled back together,
+        since a calibrator must match its adapter's data hash or predict_symbol refuses to run.
         """
-        interval = self.cfg.interval
         venv_python = Path('.venv-timesfm/bin/python')
         if not venv_python.exists():
             self.last_error = 'LoRA 재학습 불가: .venv-timesfm 없음'
@@ -1022,41 +1055,64 @@ class LiveTrader:
                 self._save_state()
             return
         env = dict(os.environ, HF_HOME=str(Path('.cache/huggingface').resolve()), HF_HUB_OFFLINE='1')
-        live_dir = Path('runs/forecast5') / interval
-        tmp_dir = Path('runs/forecast5') / f'{interval}_retrain_tmp'
-        backup_dir = Path('runs/forecast5') / f'{interval}_prev'
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
+        errors = []
         try:
             subprocess.run([sys.executable, '-m', 'prop_trader.current_candles', '--out', 'data/current'],
                            check=True, timeout=300, env=env)
-            subprocess.run([str(venv_python), '-m', 'prop_trader.timesfm_run',
-                             '--csv', f'data/current/{interval}.csv', '--out', str(tmp_dir),
-                             '--interval', interval, '--rolling-split', '--horizon', '5',
-                             '--device', 'cpu'],  # keep the GPU free for live MPS inference during retrain
-                            check=True, timeout=10800, env=env)
-            if not (tmp_dir / 'adapter' / 'adapter_model.safetensors').exists():
-                raise RuntimeError('training finished without an adapter checkpoint')
-            json.loads((tmp_dir / 'protocol.json').read_text())  # sanity: must parse
-            if backup_dir.exists():
-                shutil.rmtree(backup_dir)
-            if live_dir.exists():
-                live_dir.rename(backup_dir)
-            tmp_dir.rename(live_dir)
-            # Calibrator is keyed to the new adapter's data hash; without this, rank_coins and
-            # timesfm_predict both refuse to run ("Stale calibrator from another training snapshot").
-            subprocess.run([str(venv_python), '-m', 'prop_trader.hybrid_research'],
-                            check=True, timeout=10800, env=env)
-            if backup_dir.exists():
-                shutil.rmtree(backup_dir)
-            self.last_retrain_at = datetime.now(timezone.utc).isoformat()
-            self.last_error = None
-        except (subprocess.SubprocessError, OSError, RuntimeError, json.JSONDecodeError) as e:
-            self.last_error = f'LoRA 재학습 실패, 이전 모델 유지: {e}'
-            if backup_dir.exists():
+        except (subprocess.SubprocessError, OSError) as e:
+            self.last_error = f'LoRA 재학습 실패, 이전 모델 유지: 캔들 갱신 실패: {e}'
+            with self.lock:
+                self._save_state()
+            return
+        trained = []
+        for interval in ('1m', '1h', '1d'):
+            live_dir = Path('runs/forecast5') / interval
+            tmp_dir = Path('runs/forecast5') / f'{interval}_retrain_tmp'
+            backup_dir = Path('runs/forecast5') / f'{interval}_prev'
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+            try:
+                subprocess.run([str(venv_python), '-m', 'prop_trader.timesfm_run',
+                                 '--csv', f'data/current/{interval}.csv', '--out', str(tmp_dir),
+                                 '--interval', interval, '--rolling-split', '--horizon', '5',
+                                 '--device', 'cpu'],  # keep the GPU free for live MPS inference during retrain
+                                check=True, timeout=10800, env=env)
+                if not (tmp_dir / 'adapter' / 'adapter_model.safetensors').exists():
+                    raise RuntimeError('training finished without an adapter checkpoint')
+                json.loads((tmp_dir / 'protocol.json').read_text())  # sanity: must parse
+                if backup_dir.exists():
+                    shutil.rmtree(backup_dir)
                 if live_dir.exists():
-                    shutil.rmtree(live_dir)
-                backup_dir.rename(live_dir)
+                    live_dir.rename(backup_dir)
+                tmp_dir.rename(live_dir)
+                trained.append(interval)
+            except (subprocess.SubprocessError, OSError, RuntimeError, json.JSONDecodeError) as e:
+                errors.append(f'{interval}: {e}')
+                if tmp_dir.exists():
+                    shutil.rmtree(tmp_dir)
+        if trained:
+            # Calibrator is keyed to each adapter's data hash; without this, rank_coins and
+            # timesfm_predict both refuse to run ("Stale calibrator from another training snapshot").
+            try:
+                subprocess.run([str(venv_python), '-m', 'prop_trader.hybrid_research'],
+                                check=True, timeout=10800, env=env)
+                for interval in trained:
+                    backup_dir = Path('runs/forecast5') / f'{interval}_prev'
+                    if backup_dir.exists():
+                        shutil.rmtree(backup_dir)
+            except (subprocess.SubprocessError, OSError) as e:
+                errors.append(f'calibrator: {e}')
+                for interval in trained:
+                    live_dir = Path('runs/forecast5') / interval
+                    backup_dir = Path('runs/forecast5') / f'{interval}_prev'
+                    if backup_dir.exists():
+                        if live_dir.exists():
+                            shutil.rmtree(live_dir)
+                        backup_dir.rename(live_dir)
+                trained = []
+        self.last_error = ('LoRA 재학습 일부 실패, 해당 주기는 이전 모델 유지: ' + '; '.join(errors)) if errors else None
+        if trained:
+            self.last_retrain_at = datetime.now(timezone.utc).isoformat()
         with self.lock:
             self._save_state()
 
@@ -1080,13 +1136,24 @@ class LiveTrader:
         self.runtime.start()
         self._tick_thread = threading.Thread(target=self._tick_loop, daemon=True, name='live-tick')
         self._tick_thread.start()
-        # Resident inference pins an adapter/calibrator pair for the session.
-        # Offline backbone training must not swap files underneath that session.
+        # Resident inference no longer pins a fixed adapter/calibrator pair for the whole
+        # session: predict_symbol() reloads the LoRA adapter from disk on every call, and
+        # resident_forecasts.run() now re-reads protocol.json per job too (see that module),
+        # so a background retrain's atomic adapter+calibrator swap is picked up automatically
+        # on the next prediction for each market/interval -- no separate "activate" step needed.
+        if retrain:
+            self._retrain_thread = threading.Thread(target=self._retrain_loop, daemon=True, name='live-retrain')
+            self._retrain_thread.start()
 
     def stop(self):
         self._stop.set()
         if hasattr(self, '_tick_thread'):
             self._tick_thread.join(timeout=45)
+        if hasattr(self, '_retrain_thread'):
+            # Bounded like the tick thread's join: if a retrain subprocess is mid-flight (up to
+            # the 3h timeout in _retrain_once), this does not wait for it -- it's a daemon
+            # thread, so process exit does not hang on it either way.
+            self._retrain_thread.join(timeout=45)
         if self.runtime:
             self.runtime.stop()
 

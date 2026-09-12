@@ -9,7 +9,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-SYMBOLS = ['DOGEUSDT', 'SHIBUSDT', 'PEPEUSDT', 'FLOKIUSDT', 'BONKUSDT', 'WIFUSDT']
+# Top 10 by global market cap with an active Upbit KRW market, stablecoins excluded (CoinGecko
+# market-cap-desc cross-referenced against Upbit's market list, checked 2026-09-12). Was the
+# 6-symbol meme-coin convenience sample; switched to concentrate few-shot/retrain quality on a
+# smaller, more stable large-cap universe instead of spreading across many thin small-caps.
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'SOLUSDT', 'TRXUSDT', 'DOGEUSDT', 'LINKUSDT', 'ADAUSDT', 'XLMUSDT', 'BCHUSDT']
 ROOT = Path('data/binance')
 
 
@@ -40,7 +44,9 @@ def fetch(job):
 
 def main():
     ROOT.mkdir(parents=True, exist_ok=True)
-    # WIF spot history starts in March 2024: use full months from April onward.
+    # Range kept from the original meme-coin selection (WIF's spot history started March 2024);
+    # every current SYMBOLS entry has years more history available than this, so it's not a
+    # binding constraint -- just an unextended range, not a floor these symbols need.
     months = [f'2024-{m:02d}' for m in range(4, 13)] + [f'2025-{m:02d}' for m in range(1, 13)]
     jobs = [(s, m) for s in SYMBOLS for m in months]
     rows, sources = [], []
@@ -58,7 +64,7 @@ def main():
     (ROOT / 'manifest.json').write_text(json.dumps(dict(
         retrieved_at=datetime.now(timezone.utc).isoformat(), symbols=SYMBOLS,
         interval='1h', sources=sources, rows=len(rows),
-        selection='Fixed retrospective meme-token convenience sample; survivorship and selection bias'), indent=2))
+        selection='Top 10 by global market cap with an active Upbit KRW market, stablecoins excluded (CoinGecko-ranked, fixed 2026-09-12); survivorship and selection bias'), indent=2))
     print(f'Saved {len(rows)} rows', flush=True)
 
 

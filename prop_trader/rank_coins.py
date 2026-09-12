@@ -43,6 +43,7 @@ def rank_records(records,snapshot,notional=10000.,fee=.001,exit_slippage=.001,no
         age=now.timestamp()-float(book['timestamp'])/1000
         stale=now>=expires or age>60 or age< -5
         quote_expiry=datetime.fromtimestamp(float(book['timestamp'])/1000,timezone.utc)+timedelta(seconds=60)
+        uncertainty=record.get('predicted_uncertainty')
         rows.append(dict(symbol=symbol,exchange='upbit',quote='KRW',interval=record['interval'],horizon=5,
             as_of=record['as_of'],expected_gross_return=gross,expected_net_return=net,
             expected_pnl_krw=notional*net,notional_krw=notional,estimated_entry_vwap=entry,
@@ -51,8 +52,14 @@ def rank_records(records,snapshot,notional=10000.,fee=.001,exit_slippage=.001,no
             fee_assumption=fee,exit_slippage_assumption=exit_slippage,stale=stale,
             orderbook_timestamp=book['timestamp'],valid_until=min(expires,quote_expiry).isoformat(),
             positive_after_costs=net>0,model_status='research_unverified_cross_exchange',
+            predicted_uncertainty=uncertainty,predicted_stop_fraction=record.get('predicted_stop_fraction'),
             reason='Binance-trained adapter and calibration transferred to Upbit KRW; not validated for live execution'))
-    rows.sort(key=lambda r:(-r['expected_net_return'],r['symbol']))
+    # Conviction-adjusted: same downstream.UncertaintyHead penalty multiframe.decide() applies to
+    # the live ranking (UNCERTAINTY_PENALTY there), so this dashboard table orders candidates the
+    # same way live trading would rank them, not by raw point estimate alone. None (head not
+    # trained yet) is treated as zero penalty -- unchanged from the original sort.
+    from .multiframe import UNCERTAINTY_PENALTY
+    rows.sort(key=lambda r:(-(r['expected_net_return']-UNCERTAINTY_PENALTY*(r['predicted_uncertainty'] or 0.)),r['symbol']))
     for i,r in enumerate(rows,1):r['rank']=i
     return rows
 

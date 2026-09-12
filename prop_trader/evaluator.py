@@ -189,13 +189,25 @@ def to_rows(evaluation):
                    top_k_precision=m['top_k_directional_precision'], **da)
 
 
+DEFAULT_ROOTS = [Path('runs/forecast5/1m'), Path('runs/forecast5/1h'), Path('runs/forecast5/1d')]
+DEFAULT_REPORT_OUT = Path('runs/forecast5/EVAL_REPORT.md')
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--roots', nargs='+', type=Path, default=[Path('runs/forecast5/1m'), Path('runs/forecast5/1h'), Path('runs/forecast5/1d')])
+    p.add_argument('--roots', nargs='+', type=Path, default=DEFAULT_ROOTS)
     p.add_argument('--csv-dir', type=Path, default=Path('data/live'))
     p.add_argument('--rolling-split', action='store_true', default=True)
     p.add_argument('--shots', type=int, default=8)
+    p.add_argument('--report-out', type=Path, default=DEFAULT_REPORT_OUT,
+                    help='Where EVAL_REPORT.md is written. Defaults to the shared production path, which only '
+                         'makes sense for the canonical --roots; pass an explicit --report-out for any ad-hoc run '
+                         '(different data, extra history, a subset of intervals) so it never silently overwrites '
+                         'the shared report with a differently-scoped comparison (see hybrid_research.evaluate()\'s '
+                         'identical guard around its calibrator.json, added after that exact incident).')
     args = p.parse_args()
+    if args.roots != DEFAULT_ROOTS and args.report_out == DEFAULT_REPORT_OUT:
+        raise ValueError('--roots is non-default but --report-out was left at the shared path -- pass an explicit --report-out')
     all_rows = []
     for run_dir in args.roots:
         interval = run_dir.name
@@ -217,7 +229,8 @@ def main():
         return f'{v:.1%}' if v is not None else 'N/A'
 
     order = ['naive', 'momentum', 'zero_shot', 'lora', 'lora_fewshot']
-    for interval in ('1m', '1h', '1d'):
+    intervals_present = list(dict.fromkeys(r['interval'] for r in all_rows))  # preserve first-seen order
+    for interval in intervals_present:
         for name in order:
             row = next((r for r in all_rows if r['interval'] == interval and r['model'] == name), None)
             if row is None:
@@ -229,8 +242,8 @@ def main():
               'lora_fewshot = lora + walk-forward online adaptation on the 8 most recently completed',
               'examples at each origin. If lora_fewshot does not beat naive/momentum on DA@5 and',
               'Top-K precision here, that is reported as-is and is not treated as an improvement.']
-    Path('runs/forecast5/EVAL_REPORT.md').write_text('\n'.join(lines) + '\n')
-    print('Wrote runs/forecast5/EVAL_REPORT.md', flush=True)
+    args.report_out.write_text('\n'.join(lines) + '\n')
+    print(f'Wrote {args.report_out}', flush=True)
 
 
 if __name__ == '__main__':

@@ -125,7 +125,16 @@ def run(request_path, output_path, stop_path, max_jobs=None, parent_pid=None):
         try:
             bars = completed_bars(client, market, interval, cutoff)
             attempted.add(job)  # Few-shot is invoked only once for this completed bar.
-            row, base = predict_symbol(base, Path('runs/forecast5')/interval, protocols[interval],
+            # Re-read protocol.json fresh rather than the dict cached at process startup: a
+            # background daily retrain (live_trader._retrain_once) atomically swaps in a new
+            # adapter + protocol.json + calibrator.json together. predict_symbol always reloads
+            # the adapter from disk already, but it checks the *calibrator's* training_data_sha256
+            # against the protocol's data_sha256 -- if that came from the stale startup copy, a
+            # retrain would make every prediction fail with "belongs to another model training
+            # snapshot" until this process was restarted. Falling back to the startup copy only
+            # covers a transient read failure (e.g. mid-swap), not a routine path.
+            protocol = read_json(Path('runs/forecast5')/interval/'protocol.json', protocols[interval])
+            row, base = predict_symbol(base, Path('runs/forecast5')/interval, protocol,
                                        bars, bars[-1].timestamp, shots[interval], device, save_adapter=False)
             row['history'] = [dict(t=b.timestamp,o=b.open,h=b.high,l=b.low,c=b.close) for b in bars[-60:]]
             records.setdefault(market, {})[interval] = row

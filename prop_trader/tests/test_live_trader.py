@@ -1,7 +1,8 @@
 import unittest
 from unittest.mock import Mock
 
-from prop_trader.live_trader import LiveConfig, evaluate_entry, evaluate_position, net_external_flow
+from prop_trader.live_trader import (LiveConfig, evaluate_entry, evaluate_position, net_external_flow,
+                                      _stop_fraction, STOP_FRACTION, STOP_FRACTION_BOUNDS)
 
 
 def position(entry=100., stop=97.5, target=105., horizon=1000.):
@@ -41,6 +42,23 @@ class LiveConfigTests(unittest.TestCase):
         cfg = LiveConfig()
         self.assertEqual(cfg.mode, 'paper')
         self.assertEqual(cfg.max_positions, 3)
+
+
+class StopFractionTests(unittest.TestCase):
+    def test_falls_back_to_fixed_constant_when_unset(self):
+        self.assertEqual(_stop_fraction(None), STOP_FRACTION)
+
+    def test_falls_back_on_nonfinite_or_nonpositive(self):
+        self.assertEqual(_stop_fraction(float('nan')), STOP_FRACTION)
+        self.assertEqual(_stop_fraction(0.), STOP_FRACTION)
+        self.assertEqual(_stop_fraction(-.01), STOP_FRACTION)
+
+    def test_uses_predicted_value_within_bounds(self):
+        self.assertAlmostEqual(_stop_fraction(.02), .02)
+
+    def test_clips_to_bounds(self):
+        self.assertEqual(_stop_fraction(.5), STOP_FRACTION_BOUNDS[1])
+        self.assertEqual(_stop_fraction(.001), STOP_FRACTION_BOUNDS[0])
 
 
 class EvaluatePositionTests(unittest.TestCase):

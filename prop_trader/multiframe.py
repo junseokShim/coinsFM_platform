@@ -3,6 +3,11 @@ from .execution_rules import reprice
 import math
 
 FRAMES = ('1m', '1h', '1d')
+# How hard downstream.UncertaintyHead's predicted error penalizes ranking score. Unvalidated by
+# backtest (exit_sweep.py's search was on stop/target parameters, not this) -- starts at 1.0 (one
+# unit of expected error fully offsets one unit of expected return) and should be revisited once
+# there's enough live/paper history with the head actually trained to check it against outcomes.
+UNCERTAINTY_PENALTY = 1.0
 
 
 def decide(rows, book, now, budget, threshold=.002, held=False):
@@ -40,8 +45,23 @@ def decide(rows, book, now, budget, threshold=.002, held=False):
         strength *= .5
     sell_fraction = 1. if remaining['1d'] < -threshold or remaining['1h'] < -2*threshold else .5
     exit_strength = max(0., min(1., -remaining['1h']/volatility))
+    # Conviction-adjusted ranking: a positive edge from a forecast downstream.UncertaintyHead
+    # expects to be wrong a lot is worth less than the same edge from a reliable one. None (head
+    # not trained yet, or this snapshot's calibrator/head pair was rejected as stale) leaves
+    # score unchanged -- same fail-open convention as too_uncertain/analog gates.
+    predicted_uncertainty = rows['1h'].get('predicted_uncertainty')
+    score = net['1h']
+    conviction = None
+    if predicted_uncertainty is not None and math.isfinite(predicted_uncertainty):
+        score -= UNCERTAINTY_PENALTY * predicted_uncertainty
+        if predicted_uncertainty > 0:
+            # Expected edge per unit of the head's own expected error -- used for position
+            # sizing (buy_budget/partial_budget), not just ranking: a trade the head expects to
+            # be reliable gets sized up, a shaky one gets sized down, instead of every trade
+            # sizing off the same ATR-ratio regardless of how much the model trusts itself.
+            conviction = max(0., net['1h']) / predicted_uncertainty
     return dict(action=action, reason=reason, complete=True, returns=net,
-                remaining_returns=remaining, priced=priced, score=net['1h'],
+                remaining_returns=remaining, priced=priced, score=score, conviction=conviction,
                 signal_strength=strength, exit_strength=exit_strength, sell_fraction=sell_fraction,
                 forecast_origins={iv: rows[iv]['as_of'] for iv in FRAMES})
 
@@ -66,17 +86,43 @@ def hourly_only(rows, book, now, budget, threshold=.002):
     net_1h = priced_1h['expected_net_return']
     volatility = max(.001, atr * math.sqrt(5))
     strength = max(0., min(1., net_1h / volatility))
+    predicted_uncertainty = rows['1h'].get('predicted_uncertainty')
+    conviction = None
+    if predicted_uncertainty is not None and math.isfinite(predicted_uncertainty) and predicted_uncertainty > 0:
+        conviction = max(0., net_1h) / predicted_uncertainty
     return dict(action='STAY', reason='시간봉 단독 판단(1분봉 데이터 없음)', complete=True,
-                returns={'1h': net_1h}, priced={'1h': priced_1h}, score=net_1h,
+                returns={'1h': net_1h}, priced={'1h': priced_1h}, score=net_1h, conviction=conviction,
                 signal_strength=strength, forecast_origins={'1h': rows['1h']['as_of']})
+
+
+CONVICTION_REFERENCE = 3.0  # conviction (expected return / downstream.UncertaintyHead's own
+# expected error) that maps to full position size. Unvalidated -- no backtest has calibrated
+# this yet; revisit once there's enough live/paper history with the head actually trained to
+# check realized outcomes against it.
+
+
+def _sizing_scale(decision):
+    """0..1 position-sizing scale. Prefers conviction (expected edge per unit of the head's own
+    expected error, see decide()/hourly_only()) over the older ATR-ratio signal_strength when
+    available, so a trade the model expects to be reliable is sized up and a shaky one sized
+    down -- not every trade sizing off the same volatility ratio regardless of confidence.
+    Returns None (caller must reject the trade) on a non-finite value, same as the original
+    signal_strength guard this replaces -- garbage in should block sizing, not silently zero it."""
+    conviction = decision.get('conviction')
+    if conviction is not None:
+        return max(0., min(1., conviction / CONVICTION_REFERENCE)) if math.isfinite(conviction) else None
+    strength = decision.get('signal_strength', 0.)
+    return max(0., min(1., strength)) if math.isfinite(strength) else None
 
 
 def buy_budget(decision, cash, cap):
     from .execution_rules import minimum_entry
-    strength = decision.get('signal_strength', 0.)
-    if not decision.get('complete') or decision.get('action') != 'BUY' or not math.isfinite(strength):
+    if not decision.get('complete') or decision.get('action') != 'BUY':
         return 0.
-    amount = min(cash*.9, cap*(.35+.65*max(0., min(1., strength))))
+    scale = _sizing_scale(decision)
+    if scale is None:
+        return 0.
+    amount = min(cash*.9, cap*(.35+.65*scale))
     return amount if amount >= minimum_entry() else 0.
 
 
@@ -105,11 +151,11 @@ def partial_budget(decision, cash, cap, threshold=.002):
     from .execution_rules import minimum_entry
     if not partial_qualifies(decision, threshold):
         return 0.
-    strength = decision.get('signal_strength', 0.)
-    if not math.isfinite(strength):
+    scale = _sizing_scale(decision)
+    if scale is None:
         return 0.
     floor = minimum_entry()
-    full = cap*(.35+.65*max(0., min(1., strength)))  # what buy_budget would size at this strength
+    full = cap*(.35+.65*scale)  # what buy_budget would size at this same scale
     headroom = max(0., full-floor)
     amount = min(cash*.9, cap, floor+headroom*.5)
     return amount if amount >= floor else 0.
@@ -136,3 +182,41 @@ def candidate_score(ticker, momentum_weight=5.):
     if not math.isfinite(volume) or not math.isfinite(change) or volume < 0:
         return 0.
     return volume * (1. + max(0., change) * momentum_weight)
+
+
+def _log_returns(closes):
+    closes = [float(c) for c in closes]
+    return [math.log(b / a) for a, b in zip(closes, closes[1:]) if a > 0 and b > 0]
+
+
+def _correlation(a, b):
+    n = min(len(a), len(b))
+    if n < 2:
+        return None
+    a, b = a[-n:], b[-n:]
+    mean_a, mean_b = sum(a) / n, sum(b) / n
+    cov = sum((x - mean_a) * (y - mean_b) for x, y in zip(a, b))
+    var_a = sum((x - mean_a) ** 2 for x in a)
+    var_b = sum((y - mean_b) ** 2 for y in b)
+    if var_a <= 0 or var_b <= 0:
+        return None
+    return cov / math.sqrt(var_a * var_b)
+
+
+def too_correlated(candidate_closes, held_closes_list, max_corr=.85, min_n=10):
+    """True when the candidate's recent return series moves too much like an already-held
+    position's -- concentration risk a pure liquidity/momentum ranking never sees (several
+    correlated memecoins filling every open slot at once looks fine position-by-position).
+    Downgrade-only gate, same convention as too_uncertain/confirms_buy: only ever turns a BUY
+    into STAY, never blocks (returns False) on too little shared history to judge."""
+    candidate = _log_returns(candidate_closes)
+    if len(candidate) < min_n or not held_closes_list:
+        return False, None
+    worst = None
+    for held_closes in held_closes_list:
+        corr = _correlation(candidate, _log_returns(held_closes))
+        if corr is not None and (worst is None or corr > worst):
+            worst = corr
+    if worst is not None and worst > max_corr:
+        return True, f'보유 종목과 최근 수익률 상관계수 과다({worst:.2f} > 기준 {max_corr:.2f})'
+    return False, None

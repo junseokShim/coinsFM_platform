@@ -90,6 +90,30 @@ def predict_symbol(base,run_dir,protocol,bars,as_of,shots,device,use_technical=T
             np.array([[technical_features[k] for k in FEATURES]]))[0]
         prices=(anchor*np.exp(values)).tolist()
         if not all(math.isfinite(v) and v>0 for v in prices):raise ValueError('Invalid hybrid forecast')
+    predicted_uncertainty=None
+    predicted_stop_fraction=None
+    if technical_features is not None:
+        from .downstream import RidgeHead,head_features
+        for fname,field in (('uncertainty_head.json','predicted_uncertainty'),
+                            ('volatility_head.json','predicted_stop_fraction')):
+            head_path=Path('runs/hybrid')/interval/fname
+            if not head_path.exists():
+                continue
+            head_artifact=json.loads(head_path.read_text())
+            # Stale/mismatched snapshot: fail open (leave the field None) rather than raise --
+            # these heads are optional sizing signals, not required for a forecast to be usable,
+            # same convention as analog_signal.too_uncertain.
+            if (head_artifact['interval']!=interval or head_artifact['horizon']!=horizon
+                    or head_artifact['calibration_end']>=as_of
+                    or head_artifact['training_data_sha256']!=protocol['data_sha256']):
+                continue
+            value=float(RidgeHead.from_dict(head_artifact['model']).predict(
+                head_features(after,technical_features)[None,:])[0])
+            if math.isfinite(value):
+                if field=='predicted_uncertainty':
+                    predicted_uncertainty=value
+                else:
+                    predicted_stop_fraction=value
     quantile_prices=None
     forecast_uncertainty=None
     if quantile_log_returns is not None and all(math.isfinite(v) for step in quantile_log_returns for v in step):
@@ -118,6 +142,7 @@ def predict_symbol(base,run_dir,protocol,bars,as_of,shots,device,use_technical=T
                 max_predicted_return=stats['max_predicted_return'],min_predicted_return=stats['min_predicted_return'],
                 forecast_slope=stats['forecast_slope'],forecast_consistency=stats['forecast_consistency'],
                 quantile_prices=quantile_prices,forecast_uncertainty=forecast_uncertainty,
+                predicted_uncertainty=predicted_uncertainty,predicted_stop_fraction=predicted_stop_fraction,
                 note='Forecast after last historical bar; future targets not evaluated')
     for i,r in enumerate(stats['return_by_step'],1):record[f'return_t{i}']=r
     if save_adapter:
